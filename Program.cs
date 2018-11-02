@@ -1,5 +1,11 @@
 ﻿using System;
+using System.IO;
+using System.Linq;
+using System.Net.Http;
 using NBitcoin;
+using NBitcoin.DataEncoders;
+using Newtonsoft.Json.Linq;
+using WalletWasabi.KeyManagement;
 
 namespace NBitcoinPoC
 {
@@ -7,62 +13,65 @@ namespace NBitcoinPoC
     {
         static void Main(string[] args)
         {
-            Test1();
-        }
+            // parameters
+            var walletPath = "/home/lontivero/.walletwasabi/client/Wallets/REAL.json";
+            var txHex = File.ReadAllText("tx.hex");
+            var index = 56;
+            var tx = Transaction.Parse(txHex);
 
-        static void Test1()
-        {
-            const int P2wpkhInputSizeInBytes = 41;
 
-            var fundingKey = new Key();
-            var fundingAddress = fundingKey.PubKey.GetSegwitAddress(Network.Main);
-            var destinationAddress = new Key().PubKey.GetSegwitAddress(Network.Main);
-            var changeAddress = new Key().PubKey.GetSegwitAddress(Network.Main);
+            tx.Inputs[index].WitScript = null;
 
-            var coinOrigin = CreateTransactionWithCoin(Money.Coins(2), fundingAddress.ScriptPubKey);
-            var tb0 = new TransactionBuilder();
-            tb0.AddCoins(coinOrigin);
-            tb0.Send(destinationAddress, Money.Coins(1));
-            tb0.SetChange(changeAddress);
-            tb0.AddKeys(fundingKey);
-            var signedTx = tb0.BuildTransaction(true);
+            IndexedTxIn currentIndexedInput = tx.Inputs.AsIndexedInputs().Skip(index).First();
+            // 4. Find the corresponding registered input.
+            Coin registeredCoin;
+            TxOut output = null;
+            OutPoint prevOut = tx.Inputs[index].PrevOut;
 
-            var signedVs = signedTx.GetVirtualSize();
-            var signedRs = signedTx.GetSerializedSize();
-            var signedTotalSize = signedTx.GetSerializedSize(TransactionOptions.Witness);
-            var signedStrippedSize = signedTx.GetSerializedSize(TransactionOptions.None);
-
-            var tb1 = new TransactionBuilder();
-            tb1.AddCoins(coinOrigin);
-            tb1.Send(destinationAddress, Money.Coins(1));
-            tb1.SetChange(changeAddress);
-            var unsignedTx = tb1.BuildTransaction(true);
-
-            var unsignedVs = unsignedTx.GetVirtualSize();
-            var unsignedRs = unsignedTx.GetSerializedSize();
-            var unsignedTotalSize = unsignedTx.GetSerializedSize(TransactionOptions.Witness);
-            var unsignedStrippedSize = unsignedTx.GetSerializedSize(TransactionOptions.None);
-
-            var estimatedVirtaulSize = unsignedTx.GetVirtualSize() + (P2wpkhInputSizeInBytes * unsignedTx.Inputs.Count);
-
-            // Less tha 5%?
-            var isGoodEstimator = estimatedVirtaulSize > 0.95 * signedVs && estimatedVirtaulSize < 1.05 * signedVs;
-            Console.WriteLine(isGoodEstimator); 
-        }
-
-        static Transaction CreateTransactionWithCoin(Money amount, Script scriptPubKey)
-        {
-            var tx = Transaction.Create(Network.Main);
-            tx.Version = Transaction.CURRENT_VERSION;
-            tx.LockTime = LockTime.Zero;
-            tx.AddInput(new TxIn()
+            using (var client = new HttpClient{BaseAddress = new Uri("https://api.smartbit.com.au/v1/")})
             {
-                ScriptSig = new Script(OpcodeType.OP_0, OpcodeType.OP_0),
-                Sequence = Sequence.Final
-            });
-            tx.AddOutput(amount, scriptPubKey);
-            return tx;
+                using (HttpResponseMessage response = client.GetAsync($"blockchain/tx/{prevOut.Hash}/hex").GetAwaiter().GetResult())
+                {
+                    string cont = response.Content.ReadAsStringAsync().GetAwaiter().GetResult();
+                    var json = JObject.Parse(cont);
+                    string hex = json["hex"][0]["hex"].ToString();
+                    Transaction ttx = Transaction.Parse(hex, Network.Main);
+                    output = ttx.Outputs[prevOut.N];
+                    registeredCoin = new Coin(prevOut, output);
+                }
+            }
 
+            var km = KeyManager.FromFile(walletPath);
+            var keys = km.GetSecrets("", registeredCoin.ScriptPubKey);
+
+            var pass = false;
+            while(!pass)
+            {
+                var builder = Network.Main.CreateTransactionBuilder();
+                var signedCoinJoin = builder
+                    .ContinueToBuild(tx)
+                    .AddKeys( keys.ToArray())
+                    .AddCoins( registeredCoin )
+                    .BuildTransaction(true);
+
+                var w = signedCoinJoin.Inputs.Where(x=> x.WitScript != WitScript.Empty).FirstOrDefault();
+                tx.Inputs[index].WitScript = signedCoinJoin.Inputs[index].WitScript;
+
+
+                // 5. Verify if currentIndexedInput is correctly signed, if not, return the specific error.
+#if CONSENSUS
+                if (!Script.VerifyScriptConsensus(output.ScriptPubKey, tx, (uint)index, output.Value, ScriptVerify.Standard))
+                {
+                    Console.WriteLine($"Error");
+                }
+#else
+                if (!currentIndexedInput.VerifyScript(registeredCoin, out ScriptError error))
+                {
+                    Console.WriteLine($"Error: {error}");
+                }
+            }
+            pass = true;
+#endif
         }
     }
 }
